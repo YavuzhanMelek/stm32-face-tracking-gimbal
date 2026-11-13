@@ -2,16 +2,18 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Main program body for 3-Axis Face-Tracking Gimbal
+  * @author         : Yavuzhan Melek
+  * @description    : Implements a closed-loop face tracking system. Detects a
+  *                   human face (via ESP32-CAM) and calculates center coordinates.
+  *                   Determines positional error relative to the camera's center
+  *                   point. Uses PWM signals to autonomously drive servo motors
+  *                   to minimize error, continuously keeping the face centered.
   ******************************************************************************
   * @attention
   *
   * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
   */
@@ -24,13 +26,12 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
-#include "usbd_cdc_if.h" // USB üzerinden veri göndermek için
+#include "usbd_cdc_if.h" // For transmitting debugging data via USB
 
-//!!!!!!!!!!BURASINI GORUNTU ISLEME  KISIMINI EKLEDIKTEN SONRA EKLIYCEM yuzmodel yerine ekleyecegim modelin ismi gelecek
+// Edge AI Model includes (Ensure model name matches the generated AI files)
 #include "ai_platform.h"
 #include "yuzmodel.h"
 #include "yuzmodel_data.h"
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,71 +51,55 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2S_HandleTypeDef hi2s3;
-
 SPI_HandleTypeDef hspi1;
-
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+uint8_t size_buffer[4]; // Buffer for UART payload size (4 bytes)
 
-uint8_t size_buffer[4]; // Boyut bilgisini (4 bayt) tutacak tampon
-  // 96*96*1 // Veri için dinamik tampon (burada volatile'a ihtiyac yok cunku
-							  	  	//interrupt icinde image buffer degismiyor)
+// 96x96x1 grayscale image buffer (No volatile needed as it's not modified inside ISR)
 static uint8_t image_buffer[9216];
 
 uint8_t sync_byte = 0;
 uint32_t loop_counter = 0;
 
-
-//!!!!!!!!!!BURASINI GORUNTU ISLEME KISIMINI EKLEDIKTEN SONRA EKLIYCEM
-//GORUNTU ISLEME DOSYASINA KOYDUGUN ISMI DEGOSTIRMEYI UNUTMA MESELA BURDA YUZMODE
-ai_handle yuzmodel= AI_HANDLE_NULL;
+// AI Model Variables
+ai_handle yuzmodel = AI_HANDLE_NULL;
 ai_network_report report;
 ai_error err;
 
-//////BURADA OZELLIKLE TANITTIGIMIZ MODELE NE AD VERMISSEK ONUN ADINI YAZIYORUZ MESELA BENIMKI "YUZMODEL"
-//ram sigmadigindan dolayi modelimizi quantize ettik ondan dolayi
-//verecegimiz girdi float degil int_8 olacak yani ai da ai_i8 verecegiz
-
+// Model is INT8 quantized to fit RAM constraints. Inputs/Outputs must be ai_i8.
 static ai_u8 activations[AI_YUZMODEL_DATA_ACTIVATIONS_SIZE];
 static ai_i8 in_data[AI_YUZMODEL_IN_1_SIZE_BYTES];
-//OUTPUT KISMINI SIMDI 2 BYTE E CIKRAMA SEBEBIMIZ IKI CIKTININ OLMASI
-// --- YENİ HALİ ---
-// Model artik int8 ürettiği için tamponu da ai_i8 (yani int8_t) yapıyoruz.
+
+// Output buffer is sized for two distinct outputs (Coordinates and Probability)
 static ai_i8 out_data_int8[AI_YUZMODEL_OUT_1_SIZE_BYTES + AI_YUZMODEL_OUT_2_SIZE_BYTES];
 
-// Sadece tanımla, içini main'de dolduracağız
+// AI buffers definition (initialized in main)
 ai_buffer ai_input[AI_YUZMODEL_IN_NUM];
 ai_buffer ai_output[AI_YUZMODEL_OUT_NUM];
 
+// --- Servo Configuration ---
+// TIM2: Prescaler=83, Period=19999 -> 50Hz PWM, 1 tick = 1us
+#define SERVO_MIN_US   500    // 0 degrees
+#define SERVO_MAX_US   2500   // 180 degrees
+#define SERVO_MID_US   1500   // 90 degrees (center)
 
-// Sadece tanımla, içini main'de dolduracağız
-
-// ── Servo Ayarları ──────────────────────────────────────────
-// TIM2: Prescaler=83, Period=19999 → 50Hz PWM, 1 tick = 1μs
-#define SERVO_MIN_US   500    // 0 derece
-#define SERVO_MAX_US   2500   // 180 derece
-#define SERVO_MID_US   1500   // 90 derece (merkez)
-
-// Yumuşatma katsayısı (0.0-1.0). Küçüldükçe hareket daha yavaş/yumuşak olur.
+// Smoothing alpha (0.0-1.0). Lower means smoother/slower movement.
 #define SMOOTH_ALPHA   0.15f
 
-// Görüntü içinde hedef: merkez (0.5, 0.5)
-// cx/cy modelden 0.0-1.0 arası geliyor
+// Target center in the frame (0.5, 0.5) - model outputs coordinates between 0.0-1.0
 #define TARGET_CX      0.5f
 #define TARGET_CY      0.5f
 
-// Hata çok küçükse servoyu hareket ettirme (titreme engeli)
+// Deadzone to prevent servo jitter when error is very small
 #define DEADZONE       0.03f
 
-// Mevcut servo pozisyonları (μs cinsinden, float ile yumuşak güncellenir)
+// Current servo positions in microseconds
 static float servo_x_us = SERVO_MID_US;
 static float servo_y_us = 300.0f;
-
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -127,31 +112,29 @@ static void MX_TIM4_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
-// ── Yardımcı: float clamp ────────────────────────────────────
+// --- Helper: Float Clamp ---
 static inline float clamp_f(float v, float lo, float hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
 }
 
-// ── Normalize koordinatı servo μs değerine çevir ────────────
-// norm: 0.0 (sol/üst) → 1.0 (sağ/alt)
-// invert: ekseni ters çevirmek gerekirse 1 yap
+// --- Convert normalized coordinate to servo PWM (us) ---
+// norm: 0.0 (top/left) -> 1.0 (bottom/right)
+// invert: set to 1 to reverse axis direction
 static float coord_to_us(float norm, uint8_t invert) {
     if (invert) norm = 1.0f - norm;
     float us = SERVO_MIN_US + norm * (SERVO_MAX_US - SERVO_MIN_US);
     return clamp_f(us, SERVO_MIN_US, SERVO_MAX_US);
 }
 
-// ── Servo PWM güncelle ───────────────────────────────────────
+// --- Update Servo PWM ---
 static void servo_set(float x_us, float y_us) {
     uint32_t x = (uint32_t)clamp_f(x_us, SERVO_MIN_US, SERVO_MAX_US);
     uint32_t y = (uint32_t)clamp_f(y_us, 0.0f, 700.0f);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, x);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, y);
 }
-
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -165,26 +148,12 @@ static void servo_set(float x_us, float y_us) {
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
   /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -194,24 +163,9 @@ int main(void)
   MX_TIM4_Init();
   MX_USART3_UART_Init();
   MX_USB_DEVICE_Init();
+
   /* USER CODE BEGIN 2 */
-
-
-//  ai_yuzmodel_get_report(yuzmodel, &report); fonksiyonu, STM32 içindeki yapay zeka modelinin "kimlik kartını"
-//  okumaya yarar. Bu komut çalıştırıldığında report yapısının içine şu kritik bilgiler dolar:
-//
-//  Modelin Yapısı: Giriş ve çıkış buffer'larının tam boyutları ve kaç katmandan oluştuğu.
-//
-//  Quantization (Niceleme) Parametreleri: Bir önceki mesajda bahsettiğimiz scale ve zero_point değerleri bu fonksiyon sayesinde elde edilir.
-//
-//  Bellek Kullanımı: Modelin çalışma anında ne kadar RAM (activations) harcadığı.
-
-//!!!!!!!! BU KISIM GORUNTU ISLEME EKLENDIGINDE EKLENECEK EKLEDIGINDE TUM
-//  ISIMLERI KOYDUGUN GORUNTU ISLEMENIN ISMINE DONUSTURDUGUNDEN EMIN OL
-  // 1. Modeli Oluştur
-  // Activation buffer'ını doğrudan map'e yerleştir
-  // 1. Model Parametre Yapısını Tanımla ve İçini Doldur
-  // 2. Modeli Bu Parametrelerle Oluştur
+  // --- Neural Network Initialization ---
   err = ai_yuzmodel_create(&yuzmodel, AI_YUZMODEL_DATA_CONFIG);
   if (err.type != AI_ERROR_NONE) {
       while(1) {}
@@ -222,49 +176,43 @@ int main(void)
       while(1) {}
   }
 
-  // Bu versiyonda activation bağlama yöntemi:
+  // Link activation buffer directly in this version
   AI_BUFFER_ARRAY_ITEM_SET_ADDRESS(&params.map_activations, 0, activations);
 
-    // 3. Modeli Başlat (Artık yukarısı ayarlandığı için doğrudan params veriyoruz)
-    if (!ai_yuzmodel_init(yuzmodel, &params)) {
-        while(1) {}
-    }
+  // Initialize Model with parameters
+  if (!ai_yuzmodel_init(yuzmodel, &params)) {
+      while(1) {}
+  }
 
-    // 4. Model Kimlik Kartını Oku
-    ai_yuzmodel_get_report(yuzmodel, &report);
+  // Read Model Report/Metadata
+  ai_yuzmodel_get_report(yuzmodel, &report);
 
-    // Giriş/Çıkış katman eşlemeleri (Buralar aynı kalıyor)
-    ai_buffer* tmp_in  = ai_yuzmodel_inputs_get(yuzmodel, NULL);
-    ai_buffer* tmp_out = ai_yuzmodel_outputs_get(yuzmodel, NULL);
+  // Map Input/Output buffers
+  ai_buffer* tmp_in  = ai_yuzmodel_inputs_get(yuzmodel, NULL);
+  ai_buffer* tmp_out = ai_yuzmodel_outputs_get(yuzmodel, NULL);
 
-    ai_input[0]  = *tmp_in;
-    ai_input[0].data  = (ai_handle)in_data;
+  ai_input[0]  = *tmp_in;
+  ai_input[0].data  = (ai_handle)in_data;
 
-    ai_output[0] = tmp_out[0];
-    ai_output[1] = tmp_out[1];
+  ai_output[0] = tmp_out[0];
+  ai_output[1] = tmp_out[1];
 
-    // --- YENİ HALİ ---
-    ai_output[0].data = (ai_handle)out_data_int8;
-    ai_output[1].data = (ai_handle)(out_data_int8 + AI_YUZMODEL_OUT_1_SIZE_BYTES);
+  ai_output[0].data = (ai_handle)out_data_int8;
+  ai_output[1].data = (ai_handle)(out_data_int8 + AI_YUZMODEL_OUT_1_SIZE_BYTES);
 
-
-    // ── Servo PWM Başlat (merkez konumda) ────────────────────
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);  // X ekseni
-    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);  // Y ekseni
-    servo_set(servo_x_us, servo_y_us);
-    HAL_Delay(500); // Servoların merkeze gelmesi için bekle
-
+  // --- Start Servo PWM (Center position) ---
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);  // X axis
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);  // Y axis
+  servo_set(servo_x_us, servo_y_us);
+  HAL_Delay(500); // Wait for servos to reach center
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-
-//!!!! bu goruntu isleme algoritmasini koyduktan sonra ustteki yerine calistiracagimiz while dongusu
-
   while (1)
   {
-      // 1. HER DÖNGÜ BAŞINDA HATTI SIFIRLA
-      // Eğer UART hata verdiyse veya bir şeyler takıldıysa temizler
+      // 1. RESET UART LINE AT START OF EVERY LOOP
+      // Clear UART error flags if an overrun occurs
       if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_ORE) != RESET) {
           __HAL_UART_CLEAR_OREFLAG(&huart3);
           HAL_UART_AbortReceive(&huart3);
@@ -275,6 +223,7 @@ int main(void)
       uint8_t found = 0;
       uint32_t gray_size = 0;
 
+      // Await synchronization sequence (0xAA 0xBB 0xCC 0xDD)
       for (int attempt = 0; attempt < 20000; attempt++) {
           if (HAL_UART_Receive(&huart3, &b, 1, 2) != HAL_OK) continue;
           sync_buf[0] = sync_buf[1];
@@ -294,82 +243,74 @@ int main(void)
               gray_size = size_buf[0] | (size_buf[1]<<8) |
                           (size_buf[2]<<16) | (size_buf[3]<<24);
 
-              if (gray_size == 9216) {  // 96x96x1 grayscale
+              if (gray_size == 9216) {  // 96x96x1 grayscale validation
                   if (HAL_UART_Receive(&huart3, image_buffer, gray_size, 250) == HAL_OK) {
                       loop_counter++;
 
-                      // --- YENİ INT8 UYUMLU KOD ---
-                      // Artik float pointer kullanmiyoruz, modelin kendi girdi tipini (ai_i8) hedef aliyoruz
+                      // Target model's native input type (ai_i8)
                       ai_i8* model_input_ptr = (ai_i8*)in_data;
 
                       for(int i = 0; i < 9216; i++) {
-                          // Görüntü tamponundaki 0-255 arası uint8 veriyi int8 formatına dönüştürüp atıyoruz.
-                          // INT8 quantization girdiyi işaretli (signed) aralıkta bekleyebilir, cast etmek en güvenlisidir.
+                          // Convert uint8 (0-255) to int8 (-128 to 127) for quantization
                           model_input_ptr[i] = (ai_i8)(image_buffer[i] - 128);
                       }
 
                       if (ai_yuzmodel_run(yuzmodel, ai_input, ai_output) > 0) {
-                    	  // --- 1. ÇIKIŞ GRUBU: KOORDİNATLAR (OUT_1) ---
-                    	      // Modelden gelen ham int8 veriler
-                    	      ai_i8 raw_cx = ((ai_i8*)ai_output[0].data)[0];
-                    	      ai_i8 raw_cy = ((ai_i8*)ai_output[0].data)[1];
-                    	      ai_i8 raw_prob = ((ai_i8*)ai_output[1].data)[0];
+                          // --- Output Group 1: Coordinates and Probability ---
+                          ai_i8 raw_cx = ((ai_i8*)ai_output[0].data)[0];
+                          ai_i8 raw_cy = ((ai_i8*)ai_output[0].data)[1];
+                          ai_i8 raw_prob = ((ai_i8*)ai_output[1].data)[0];
 
-							  if (raw_prob >= 120) {
-								  // Model 120 ile 127 arasında bir değer ürettiyse resmen %95-%100 emindir.
-								  // Yüz kesin olarak algılandı: Bildirim LED'ini yak
-								  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_SET);
-								  // int8 → 0.0-1.0 normalize
-								  // Model çıktısı: -128..+127 → 0.0..1.0
-//								  float cx = clamp_f((float)(raw_cx + 128) / 255.0f, 0.0f, 1.0f);
-//								  float cy = clamp_f((float)(raw_cy + 128) / 255.0f, 0.0f, 1.0f);
-								  float cx = ((float)raw_cx - (-70.0f)) / (10.0f - (-70.0f));
-								  cx = cx < 0.0f ? 0.0f : (cx > 1.0f ? 1.0f : cx);
+                          if (raw_prob >= 120) {
+                              // Values >= 120 indicate high confidence. Face successfully detected.
+                              HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_SET); // Turn on indicator LED
+                              
+                              // int8 -> 0.0-1.0 normalization mapping
+                              float cx = ((float)raw_cx - (-70.0f)) / (10.0f - (-70.0f));
+                              cx = cx < 0.0f ? 0.0f : (cx > 1.0f ? 1.0f : cx);
 
-								  float cy = ((float)raw_cy - (-80.0f)) / (-10.0f - (-80.0f));
-								  cy = cy < 0.0f ? 0.0f : (cy > 1.0f ? 1.0f : cy);
-								  // yüzün merkezden farkı
-								  float cx_m = 1.0f - cx;
-								  float err_x = cx_m - TARGET_CX;
-								  float err_y = cy  - TARGET_CY;
+                              float cy = ((float)raw_cy - (-80.0f)) / (-10.0f - (-80.0f));
+                              cy = cy < 0.0f ? 0.0f : (cy > 1.0f ? 1.0f : cy);
+                              
+                              // Distance from center (Error Calculation)
+                              float cx_m = 1.0f - cx;
+                              float err_x = cx_m - TARGET_CX;
+                              float err_y = cy  - TARGET_CY;
 
-								  // Deadzone: çok küçük hatayı yoksay (titreme engeli)
-								  if (err_x > -DEADZONE && err_x < DEADZONE) err_x = 0.0f;
-								  if (err_y > -DEADZONE && err_y < DEADZONE) err_y = 0.0f;
+                              // Deadzone: Ignore minor errors to prevent jitter
+                              if (err_x > -DEADZONE && err_x < DEADZONE) err_x = 0.0f;
+                              if (err_y > -DEADZONE && err_y < DEADZONE) err_y = 0.0f;
 
-								  // Kaldığı yerden proportional adım
-								  float step_x = -err_x * (SERVO_MAX_US - SERVO_MIN_US) * SMOOTH_ALPHA; // Motor ters takılı: işareti ters çevir
-								  float step_y = err_y * (700.0f - 0.0f) * SMOOTH_ALPHA;
+                              // Proportional step from current position
+                              // Note: Invert sign for X axis if motor is mounted backwards
+                              float step_x = -err_x * (SERVO_MAX_US - SERVO_MIN_US) * SMOOTH_ALPHA; 
+                              float step_y = err_y * (700.0f - 0.0f) * SMOOTH_ALPHA;
 
-								  servo_x_us = clamp_f(servo_x_us + step_x, SERVO_MIN_US, SERVO_MAX_US);
-								  servo_y_us = clamp_f(servo_y_us + step_y, 0.0f, 700.0f);
+                              servo_x_us = clamp_f(servo_x_us + step_x, SERVO_MIN_US, SERVO_MAX_US);
+                              servo_y_us = clamp_f(servo_y_us + step_y, 0.0f, 700.0f);
 
-								  servo_set(servo_x_us, servo_y_us);
-								  send_debug(raw_cx, raw_cy, raw_prob, cx, cy);
+                              servo_set(servo_x_us, servo_y_us);
+                              send_debug(raw_cx, raw_cy, raw_prob, cx, cy);
 
-							  } else {
-								  // Diğer tüm durumlarda (masayı falan gördüğünde bu değer düşecektir) LED'i söndür
-								  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
-							  }
-
-
-
-
-
+                          } else {
+                              // Turn off LED if no face is detected confidently
+                              HAL_GPIO_WritePin(GPIOD, GPIO_PIN_13, GPIO_PIN_RESET);
+                          }
                       }
+                  }
               } else {
                   HAL_UART_AbortReceive(&huart3);
               }
           }
       }
   }
-    /* USER CODE END WHILE */
+  /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
+  /* USER CODE BEGIN 3 */
 
   /* USER CODE END 3 */
 }
-}
+
 /**
   * @brief System Clock Configuration
   * @retval None
@@ -379,14 +320,9 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -400,8 +336,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -422,14 +356,6 @@ void SystemClock_Config(void)
   */
 static void MX_I2S3_Init(void)
 {
-
-  /* USER CODE BEGIN I2S3_Init 0 */
-
-  /* USER CODE END I2S3_Init 0 */
-
-  /* USER CODE BEGIN I2S3_Init 1 */
-
-  /* USER CODE END I2S3_Init 1 */
   hi2s3.Instance = SPI3;
   hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
   hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
@@ -443,10 +369,6 @@ static void MX_I2S3_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2S3_Init 2 */
-
-  /* USER CODE END I2S3_Init 2 */
-
 }
 
 /**
@@ -456,15 +378,6 @@ static void MX_I2S3_Init(void)
   */
 static void MX_SPI1_Init(void)
 {
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
@@ -481,10 +394,6 @@ static void MX_SPI1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**
@@ -494,18 +403,10 @@ static void MX_SPI1_Init(void)
   */
 static void MX_TIM2_Init(void)
 {
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 83;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -547,11 +448,7 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
-
 }
 
 /**
@@ -561,18 +458,10 @@ static void MX_TIM2_Init(void)
   */
 static void MX_TIM4_Init(void)
 {
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
   htim4.Instance = TIM4;
   htim4.Init.Prescaler = 83;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -610,11 +499,7 @@ static void MX_TIM4_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
   HAL_TIM_MspPostInit(&htim4);
-
 }
 
 /**
@@ -624,14 +509,6 @@ static void MX_TIM4_Init(void)
   */
 static void MX_USART3_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 2000000;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -644,10 +521,6 @@ static void MX_USART3_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
 }
 
 /**
@@ -658,9 +531,6 @@ static void MX_USART3_UART_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
@@ -672,13 +542,8 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin|Audio_RST_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : CS_I2C_SPI_Pin */
   GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
@@ -716,10 +581,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
-                           Audio_RST_Pin */
-  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin;
+  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin Audio_RST_Pin */
+  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin|Audio_RST_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -744,10 +607,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -771,28 +630,14 @@ void send_debug(ai_i8 raw_cx, ai_i8 raw_cy, ai_i8 raw_prob, float cx, float cy) 
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
